@@ -7,14 +7,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/centrifuge/go-substrate-rpc-client/v4/registry/retriever"
+	"github.com/centrifuge/go-substrate-rpc-client/v4/scale"
 	"github.com/centrifuge/go-substrate-rpc-client/v4/types/extrinsic"
 	"github.com/centrifuge/go-substrate-rpc-client/v4/types/extrinsic/extensions"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/centrifuge/go-substrate-rpc-client/v4/rpc/author"
-	"github.com/centrifuge/go-substrate-rpc-client/v4/scale"
 	"github.com/centrifuge/go-substrate-rpc-client/v4/signature"
 	"github.com/centrifuge/go-substrate-rpc-client/v4/types"
 	"github.com/rs/zerolog/log"
@@ -23,20 +25,22 @@ import (
 )
 
 type SubstrateClient struct {
-	key       *signature.KeyringPair // Keyring used for signing
-	nonceLock sync.Mutex             // Locks nonce for updates
-	nonce     types.U32              // Latest account nonce
-	tip       uint64
-	Conn      *connection.Connection
-	ChainID   *big.Int
+	key            *signature.KeyringPair // Keyring used for signing
+	nonceLock      sync.Mutex             // Locks nonce for updates
+	nonce          types.U32              // Latest account nonce
+	tip            uint64
+	Conn           *connection.Connection
+	eventRetriever retriever.EventRetriever
+	ChainID        *big.Int
 }
 
-func NewSubstrateClient(conn *connection.Connection, key *signature.KeyringPair, chainID *big.Int, tip uint64) *SubstrateClient {
+func NewSubstrateClient(conn *connection.Connection, key *signature.KeyringPair, chainID *big.Int, tip uint64, eventRetriever retriever.EventRetriever) *SubstrateClient {
 	return &SubstrateClient{
-		key:     key,
-		Conn:    conn,
-		ChainID: chainID,
-		tip:     tip,
+		key:            key,
+		Conn:           conn,
+		ChainID:        chainID,
+		tip:            tip,
+		eventRetriever: eventRetriever,
 	}
 }
 
@@ -56,7 +60,7 @@ func (c *SubstrateClient) Transact(method string, args ...interface{}) (types.Ha
 		return types.Hash{}, nil, fmt.Errorf("failed to construct call: %w", err)
 	}
 
-	ext := extrinsic.NewDynamicExtrinsic(&call)
+	ext := extrinsic.NewExtrinsic(call)
 
 	// Get latest runtime version
 	rv, err := c.Conn.RPC.State.GetRuntimeVersionLatest()
@@ -87,8 +91,7 @@ func (c *SubstrateClient) Transact(method string, args ...interface{}) (types.Ha
 	if err != nil {
 		return types.Hash{}, nil, fmt.Errorf("submission of extrinsic failed: %w", err)
 	}
-
-	hash, err := DynamicExtrinsicHash(ext)
+	hash, err := ExtrinsicHash(ext)
 	if err != nil {
 		return types.Hash{}, nil, err
 	}
@@ -99,7 +102,7 @@ func (c *SubstrateClient) Transact(method string, args ...interface{}) (types.Ha
 	return hash, sub, nil
 }
 
-func (c *SubstrateClient) TrackExtrinsic(extHash types.Hash, sub *author.ExtrinsicStatusSubscription) error {
+func (c *SubstrateClient) TrackExtrinsic(extHash types.Hash, sub *author.ExtrinsicStatusSubscription, extrinsicMethod string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(time.Minute*10))
 	defer sub.Unsubscribe()
 	defer cancel()
@@ -113,7 +116,7 @@ func (c *SubstrateClient) TrackExtrinsic(extHash types.Hash, sub *author.Extrins
 				}
 				if status.IsFinalized {
 					log.Info().Str("extrinsic", extHash.Hex()).Msgf("Extrinsic is finalized in block with hash: %#x", status.AsFinalized)
-					return c.checkExtrinsicSuccess(extHash, status.AsFinalized)
+					return c.checkExtrinsicSuccess(extHash, status.AsFinalized, extrinsicMethod)
 				}
 			}
 		case <-ctx.Done():
@@ -148,13 +151,13 @@ func (c *SubstrateClient) nextNonce(meta *types.Metadata) (types.U32, error) {
 	return latestNonce, nil
 }
 
-func (c *SubstrateClient) submitAndWatchExtrinsic(meta *types.Metadata, ext extrinsic.DynamicExtrinsic, opts ...extrinsic.SigningOption) (*author.ExtrinsicStatusSubscription, error) {
+func (c *SubstrateClient) submitAndWatchExtrinsic(meta *types.Metadata, ext extrinsic.Extrinsic, opts ...extrinsic.SigningOption) (*author.ExtrinsicStatusSubscription, error) {
 	err := ext.Sign(*c.key, meta, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	sub, err := c.Conn.RPC.Author.SubmitAndWatchDynamicExtrinsic(ext)
+	sub, err := c.Conn.RPC.Author.SubmitAndWatchExtrinsic(ext)
 	if err != nil {
 		return nil, err
 	}
@@ -162,26 +165,17 @@ func (c *SubstrateClient) submitAndWatchExtrinsic(meta *types.Metadata, ext extr
 	return sub, nil
 }
 
-func (c *SubstrateClient) checkExtrinsicSuccess(extHash types.Hash, blockHash types.Hash) error {
-	block, err := c.Conn.Chain.GetBlock(blockHash)
+func (c *SubstrateClient) checkExtrinsicSuccess(extHash types.Hash, blockHash types.Hash, extrinsicMethod string) error {
+	blockEvents, err := c.eventRetriever.GetEvents(blockHash)
 	if err != nil {
 		return err
 	}
 
-	evts, err := c.Conn.GetBlockEvents(blockHash)
-	if err != nil {
-		return err
-	}
-
-	for _, event := range evts {
-		index := event.Phase.AsApplyExtrinsic
-		hash, err := ExtrinsicHash(block.Block.Extrinsics[index])
-		if err != nil {
-			return err
-		}
-
-		if extHash != hash {
-			continue
+	extrinsicCallCounter := 0
+	extrinsicSuccessCounter := 0
+	for _, event := range blockEvents {
+		if strings.EqualFold(event.Name, extrinsicMethod) {
+			extrinsicCallCounter++
 		}
 
 		if event.Name == events.ExtrinsicFailedEvent {
@@ -191,8 +185,12 @@ func (c *SubstrateClient) checkExtrinsicSuccess(extHash types.Hash, blockHash ty
 			return fmt.Errorf("extrinsic failed with failed handler execution")
 		}
 		if event.Name == events.ExtrinsicSuccessEvent {
-			return nil
+			extrinsicSuccessCounter++
 		}
+	}
+
+	if extrinsicCallCounter == 1 && extrinsicSuccessCounter >= 1 {
+		return nil
 	}
 
 	return fmt.Errorf("no event found")
@@ -206,17 +204,7 @@ func (c *SubstrateClient) LatestBlock() (*big.Int, error) {
 	return big.NewInt(int64(block.Block.Header.Number)), nil
 }
 
-func ExtrinsicHash(ext types.Extrinsic) (types.Hash, error) {
-	extHash := bytes.NewBuffer([]byte{})
-	encoder := scale.NewEncoder(extHash)
-	err := ext.Encode(*encoder)
-	if err != nil {
-		return types.Hash{}, err
-	}
-	return types.NewHash(extHash.Bytes()), nil
-}
-
-func DynamicExtrinsicHash(ext extrinsic.DynamicExtrinsic) (types.Hash, error) {
+func ExtrinsicHash(ext extrinsic.Extrinsic) (types.Hash, error) {
 	extHash := bytes.NewBuffer([]byte{})
 	encoder := scale.NewEncoder(extHash)
 	err := ext.Encode(*encoder)

@@ -12,6 +12,7 @@ import (
 	reflect "reflect"
 
 	types "github.com/centrifuge/go-substrate-rpc-client/v4/types"
+	block "github.com/centrifuge/go-substrate-rpc-client/v4/types/block"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -39,10 +40,10 @@ func (m *MockChainConnection) EXPECT() *MockChainConnectionMockRecorder {
 }
 
 // GetBlock mocks base method.
-func (m *MockChainConnection) GetBlock(arg0 types.Hash) (*types.SignedBlock, error) {
+func (m *MockChainConnection) GetBlock(arg0 types.Hash) (*block.SignedBlock, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetBlock", arg0)
-	ret0, _ := ret[0].(*types.SignedBlock)
+	ret0, _ := ret[0].(*block.SignedBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
